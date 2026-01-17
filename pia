@@ -1,0 +1,147 @@
+#!/bin/bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+
+
+log() {
+    logger -t pia "$@"
+}
+
+do_show_region() {
+    local country=$1
+    if [[ -z $country ]]; then
+        exec curl -s -L https://serverlist.piaservers.net/vpninfo/servers/v6 | head -n1 | jq
+    else
+        exec curl -s -L https://serverlist.piaservers.net/vpninfo/servers/v6 | head -n1 | jq -r ".regions[] | select(.country == \"$country\" and .port_forward == true)"
+    fi
+}
+
+setup_kill_switch() {
+    if ! iptables -L OUTPUT -n | grep -i 'policy drop'; then
+        iptables -F OUTPUT
+        iptables -A OUTPUT -s 127.0.0.1/32 -d 127.0.0.1/32 -j ACCEPT
+        iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        local ips=("8.8.8.8" "104.18.40.93" "172.64.147.163" "104.18.159.201" "104.19.240.167")
+        for ip in "${ips[@]}"; do
+            iptables -A OUTPUT -d "$ip" -j ACCEPT
+        done
+        for ip in "${PIA_PASSTHROUGH_DEST_IP_RANGES[@]}"; do
+            iptables -A OUTPUT -d "$ip" -j ACCEPT
+        done
+        iptables -P OUTPUT DROP
+    fi
+
+    local nums=$(iptables -L OUTPUT -n --line-number | awk '/PIA_VPN/ {print $1}' | sort -r)
+    for idx in $nums; do
+        iptables -D OUTPUT "$idx"
+    done
+}
+
+start_vpn() {
+    local region="$1"
+    local protocol="$2"
+
+    local PIA_USER=""
+    local PIA_PASS=""
+    local PIA_REGION=""
+
+    . "$SCRIPT_DIR/.env"
+
+    if [[ -z $region ]] && [[ ! -z $PIA_REGION ]]; then
+        region=$PIA_REGION
+    fi
+
+    if [[ -z $PIA_USER || -z $PIA_PASS || -z $region ]]; then
+        log "PIA credentials/region not set in $SCRIPT_DIR/.env or command option"
+        exit 1
+    fi
+
+    setup_kill_switch
+
+    rc-service strongswan stop || true
+    pkill charon || true
+
+    export EXTRA_CURL_OPT="--dns-servers 8.8.8.8"
+    export USE_LOGGER=1
+
+    local PIA_TOKEN=""
+    . ./get_token.sh
+    if [[ -z $PIA_TOKEN ]]; then
+        log "PIA_TOKEN is not set by get_token.sh"
+        exit 1
+    fi
+    PORT_FORWARD_MAX_POLL_NUM=30 CONNECT_PRE_HOOK=./connect_pre_hook.sh CONNECT_POST_HOOK=./connect_post_hook.sh PORT_FORWARD_HOOK=./port_forwarding_hook.sh PIA_PF=true PREFERRED_REGION="$region" VPN_PROTOCOL="$protocol" . ./get_region.sh
+    log "VPN process is stopped"
+}
+
+g_exit_script=""
+
+cleanup() {
+    log "Exit handler called"
+    trap - EXIT SIGINT SIGTERM
+    if [[ -n $g_exit_script ]]; then
+        $g_exit_script
+        g_exit_script=""
+    fi
+    exit
+}
+
+install_exit_hook() {
+    if [[ -z $g_exit_script ]]; then
+        g_exit_script="$SCRIPT_DIR/exit_hook.sh"
+    fi
+    trap cleanup EXIT SIGINT SIGTERM
+}
+
+main() {
+    # if rc-service pia status | grep -q "started"; then
+    #     echo "PIA daemon is already up"
+    #     exit 1
+    # fi
+    local protocol=ikev2
+    local show_region=0
+    local country=""
+    local region=""
+    local kill_switch_only=0
+
+    while getopts r:p:sc:t:k flag; do
+        case "${flag}" in
+            r) region=${OPTARG}
+               ;;
+            k) kill_switch_only=1
+               ;;
+            p) protocol=${OPTARG}
+               ;;
+            s) show_region=1
+               ;;
+            c) country=${OPTARG}
+               ;;
+            t) g_exit_script=${OPTARG}
+               ;;
+            *) echo Unexpected option -"$flag"
+               exit 1
+               ;;
+        esac
+    done
+
+    cd "$SCRIPT_DIR"
+
+    if [ $show_region -eq 1 ]; then
+        do_show_region "$country"
+    elif [ $kill_switch_only -eq 1 ]; then
+        setup_kill_switch
+    else
+        install_exit_hook
+        start_vpn "$region" "$protocol"
+    fi
+    log "Exiting, reached end of the script"
+}
+
+main "$@"
